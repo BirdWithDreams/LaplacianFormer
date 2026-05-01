@@ -4,6 +4,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -82,9 +83,11 @@ template <typename acc_t, int N_MAX, int BLOCK_THREADS>
 __device__ __forceinline__ acc_t compute_alpha(
         acc_t* __restrict__ sPbuf, int STRIDE, int N, int tid)
 {
-    // Each thread tid<N owns one row sum of sPbuf (P = mat + 0.01*I). We
-    // subtract the diagonal perturbation back out so alpha matches the
-    // reference `alpha = 1.8 / max_row_sum(mat)^2`.
+    // Each thread tid<N owns one row sum of sPbuf (P = mat + 0.01*I).
+    // The Newton-Schulz scaling must use the regularized matrix P that is
+    // actually inverted. Using mat alone makes alpha explode when the
+    // Laplacian kernel values are tiny and the diagonal perturbation
+    // dominates, which causes the iteration to diverge.
     acc_t my_row = acc_t(-1e30);
     if (tid < N) {
         acc_t s = acc_t(0);
@@ -92,7 +95,7 @@ __device__ __forceinline__ acc_t compute_alpha(
         for (int j = 0; j < N_MAX; ++j) {
             if (j < N) s += sPbuf[tid * STRIDE + j];
         }
-        my_row = s - acc_t(0.01);
+        my_row = s;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -604,16 +607,22 @@ static int query_max_smem() {
 //                                                    block of smem_bytes).
 template <typename FnPtr>
 static void smem_carveout_max(FnPtr fn, size_t smem_bytes) {
-    cudaFuncSetAttribute(fn,
+    C10_CUDA_CHECK(cudaFuncSetAttribute(fn,
         cudaFuncAttributePreferredSharedMemoryCarveout,
-        cudaSharedmemCarveoutMaxShared);
+        cudaSharedmemCarveoutMaxShared));
     int device_max_smem = query_max_smem();
-    if (smem_bytes > 48 * 1024 || device_max_smem > 48 * 1024) {
-        int want = static_cast<int>(smem_bytes);
-        if (device_max_smem > want) want = device_max_smem;
-        cudaFuncSetAttribute(fn,
+    if (smem_bytes > 48 * 1024) {
+        TORCH_CHECK(
+            smem_bytes <= static_cast<size_t>(device_max_smem),
+            "NewtonInverse kernel requires ",
+            smem_bytes,
+            " bytes of dynamic shared memory, but this device only allows ",
+            device_max_smem,
+            " bytes per block"
+        );
+        C10_CUDA_CHECK(cudaFuncSetAttribute(fn,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            want);
+            static_cast<int>(smem_bytes)));
     }
 }
 
